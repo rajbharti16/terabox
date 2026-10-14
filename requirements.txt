@@ -1,0 +1,7 @@
+pyrofork
+tgcrypto
+aiohttp
+aiofiles
+httpx
+motor
+python-dotenv
