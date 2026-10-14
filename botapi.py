@@ -4,6 +4,7 @@ Thin Bot API client. Used for every message that needs colored buttons
 Big file uploads still go through Pyrogram (MTProto, up to 2 GB).
 If Telegram rejects the fancy parts, the call is retried with plain emoji/buttons.
 """
+import asyncio
 import re
 
 import httpx
@@ -56,20 +57,28 @@ def _plain(params):
 
 
 async def call(method, **params):
-    for attempt in (0, 1):
+    plain_tried = False
+    for _ in range(4):
         r = await _http.post(_API + method, json=params)
         data = r.json()
         if data.get("ok"):
             return data["result"]
+        code = data.get("error_code")
         desc = data.get("description", "")
         if "not modified" in desc:
             return None
-        if attempt == 0 and data.get("error_code") == 400:
+        if code == 429:  # flood limit -> wait and retry
+            wait = (data.get("parameters") or {}).get("retry_after", 3)
+            await asyncio.sleep(min(wait, 15))
+            continue
+        if code == 400 and not plain_tried:  # premium emoji / colored buttons rejected -> plain fallback
+            plain_tried = True
             plain = _plain(params)
             if plain != params:
                 params = plain
                 continue
-        raise TGError(data.get("error_code"), desc)
+        raise TGError(code, desc)
+    raise TGError(429, "Too many retries")
 
 
 async def send(chat_id, text, markup=None, reply_to=None):
