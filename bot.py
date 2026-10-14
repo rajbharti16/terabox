@@ -22,9 +22,15 @@ from config import (
 from ui import bar, e, eid, human, trunc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)      # httpx logs the bot token in URLs
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("terabox-bot")
 
 app = Client("terabox_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+
+# Only react to messages from real users. Without this the bot also receives its own
+# messages (sent via Bot API) and answers them forever.
+IN = filters.incoming & ~filters.bot
 
 SEM = asyncio.Semaphore(MAX_PARALLEL)
 BUSY: set[int] = set()          # users with a download running
@@ -167,7 +173,7 @@ async def fail(chat_id, status_id, ex):
 
 
 # ---------------- handlers ----------------
-@app.on_message(filters.command("start"))
+@app.on_message(filters.command("start") & IN)
 async def start(client, message: Message):
     await track(message)
     name = message.from_user.first_name if message.from_user else "there"
@@ -184,13 +190,18 @@ async def nav(client, cq: CallbackQuery):
     await cq.answer()
 
 
-@app.on_message(filters.text & ~filters.regex(r"^/") & ~filters.via_bot)
+@app.on_message(IN & filters.text & ~filters.regex(r"^/") & ~filters.via_bot)
 async def on_text(client, message: Message):
+    if message.outgoing or (message.from_user and message.from_user.is_bot):
+        return
     m = terabox.LINK_RE.search(message.text)
     if not m:
         if message.chat.id > 0:
-            await botapi.send(message.chat.id, f"{e('cross')} Please send a valid <b>Terabox link</b>.",
-                              reply_to=message.id)
+            try:
+                await botapi.send(message.chat.id, f"{e('cross')} Please send a valid <b>Terabox link</b>.",
+                                  reply_to=message.id)
+            except Exception as ex:
+                log.warning("reply failed: %s", ex)
         return
     await track(message)
     await handle_link(message, m.group(0))
