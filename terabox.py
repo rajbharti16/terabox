@@ -6,6 +6,8 @@ Resolver order:
   1. Official share API with your (throwaway) account cookie  -> TERABOX_COOKIE
   2. Optional third-party resolver API                        -> TERABOX_API_URL
 """
+import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -15,6 +17,9 @@ import aiofiles
 import aiohttp
 
 from config import TERABOX_API_URL, TERABOX_COOKIE
+
+
+log = logging.getLogger("terabox")
 
 
 class TeraboxError(Exception):
@@ -65,39 +70,143 @@ def _headers(with_cookie: bool = True) -> dict:
     return h
 
 
-# ---------- 1) official share API ----------
-async def _official(surl: str, s: aiohttp.ClientSession):
-    base = {"app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0"}
-    out: list[TeraFile] = []
+# ---------- 1) official share API (scrapes jsToken from the share page) ----------
+_TOKEN_PATTERNS = (
+    r"fn%28%22([^%\"']+)%22%29",
+    r"fn\(\"([^\"]+)\"\)",
+    r"\"jsToken\"\s*:\s*\"([^\"]+)\"",
+    r"jsToken\s*=\s*['\"]([^'\"]+)['\"]",
+)
 
-    async def list_dir(path=None):
-        params = {**base, "shorturl": surl, "page": "1", "num": "100", "by": "name", "order": "asc"}
-        params.update({"root": "1"} if path is None else {"dir": path, "root": "0"})
-        async with s.get(f"{BASE}/share/list", params=params) as r:
-            data = await r.json(content_type=None)
-        if data.get("errno") not in (0, None):
-            raise TeraboxError(f"Terabox error {data.get('errno')} (link expired/private or cookie invalid)")
+
+def _find_token(page: str) -> Optional[str]:
+    for pat in _TOKEN_PATTERNS:
+        m = re.search(pat, page)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _why(errno, msg="") -> str:
+    if errno == 400210:
+        return "Terabox asks for verification (need verify_v2), direct access is blocked"
+    return f"Terabox error {errno} {msg}".strip()
+
+
+async def _get_json(s: aiohttp.ClientSession, url: str, params: dict) -> dict:
+    async with s.get(url, params=params) as r:
+        txt = await r.text()
+        status = r.status
+    try:
+        data = json.loads(txt)
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        log.warning("%s -> non-JSON response (HTTP %s): %.120r", urlparse(url).path, status, txt)
+        return {}
+
+
+async def _official(url: str, s: aiohttp.ClientSession) -> list[TeraFile]:
+    async with s.get(url, allow_redirects=True) as r:
+        page = await r.text()
+        status = r.status
+        final_url = str(r.url)
+    fin = urlparse(final_url)
+    base = f"{fin.scheme}://{fin.netloc}"
+    surl = (parse_qs(fin.query).get("surl") or [None])[0] or get_surl(final_url) or get_surl(url)
+    token = _find_token(page)
+    m = re.search(r"dp-logid=([^&\"'\s]+)", page)
+    logid = m.group(1) if m else None
+    log.info("share page: HTTP %s host=%s surl=%s jsToken=%s logid=%s cookie=%s",
+             status, fin.netloc, bool(surl), bool(token), bool(logid), bool(TERABOX_COOKIE))
+    if not surl:
+        raise TeraboxError("Could not read the share id from this link.")
+
+    common = {"app_id": "250528", "web": "1", "channel": "0"}
+    if token:
+        common["jsToken"] = token
+    if logid:
+        common["dp-logid"] = logid
+    list_params = {**common, "page": "1", "num": "100", "by": "name", "order": "asc", "shorturl": surl, "root": "1"}
+
+    async def list_dir(path, extra):
+        q = {**list_params, **extra}
+        if path is not None:
+            q.update({"dir": path, "root": "0"})
+        data = await _get_json(s, f"{base}/share/list", q)
+        errno = data.get("errno", -1)
+        if errno != 0:
+            raise TeraboxError(_why(errno, data.get("errmsg", "")))
         return data.get("list") or []
 
-    async def walk(items, depth=0):
-        for it in items:
-            if len(out) >= 50:
-                return
-            if str(it.get("isdir")) == "1":
-                if depth < 3:
-                    await walk(await list_dir(it.get("path")), depth + 1)
-            elif it.get("dlink"):
-                thumbs = it.get("thumbs") or {}
-                out.append(
-                    TeraFile(
-                        name=it.get("server_filename") or "terabox_file",
-                        size=int(it.get("size") or 0),
-                        dlink=it["dlink"],
-                        thumb=thumbs.get("url3") or thumbs.get("url2") or thumbs.get("url1"),
-                    )
-                )
+    async def collect(extra: dict) -> list[dict]:
+        out: list[dict] = []
 
-    await walk(await list_dir())
+        async def walk(items, depth=0):
+            for it in items:
+                if len(out) >= 50:
+                    return
+                if str(it.get("isdir")) == "1":
+                    if depth < 3:
+                        await walk(await list_dir(it.get("path"), extra), depth + 1)
+                else:
+                    out.append(it)
+
+        await walk(await list_dir(None, extra))
+        return out
+
+    signed: dict = {}
+    first_err: Optional[Exception] = None
+    items: list[dict] = []
+
+    async def get_signed() -> dict:
+        nonlocal signed
+        if signed:
+            return signed
+        info = await _get_json(s, f"{base}/api/shorturlinfo", list_params)
+        errno = info.get("errno", -1)
+        if errno != 0:
+            raise TeraboxError(_why(errno, info.get("errmsg", "")))
+        signed = {k: str(info[k]) for k in ("sign", "timestamp", "shareid", "uk", "randsk") if info.get(k) is not None}
+        return signed
+
+    try:
+        items = await collect({})
+    except TeraboxError as ex:
+        first_err = ex
+        log.info("share/list (unsigned) failed: %s", ex)
+    if not items:
+        try:
+            items = await collect(await get_signed())
+        except TeraboxError as ex:
+            first_err = first_err or ex
+            log.info("share/list (signed) failed: %s", ex)
+    if not items:
+        raise first_err or TeraboxError("Terabox returned an empty file list")
+
+    out: list[TeraFile] = []
+    for it in items:
+        dl = it.get("dlink")
+        if not dl and it.get("fs_id"):
+            try:
+                sg = await get_signed()
+                d = await _get_json(s, f"{base}/share/download", {
+                    **common, **sg, "primaryid": sg.get("shareid", ""), "product": "share",
+                    "nozip": "0", "fid_list": f"[{it['fs_id']}]",
+                })
+                dl = d.get("dlink") or ((d.get("list") or [{}])[0].get("dlink"))
+                if not dl:
+                    log.info("share/download: no dlink (errno=%s)", d.get("errno"))
+            except Exception as ex:
+                log.info("share/download failed: %s", ex)
+        if dl:
+            thumbs = it.get("thumbs") or {}
+            out.append(TeraFile(
+                name=it.get("server_filename") or "terabox_file",
+                size=int(it.get("size") or 0),
+                dlink=dl,
+                thumb=thumbs.get("url3") or thumbs.get("url2") or thumbs.get("url1"),
+            ))
+    log.info("official resolver: %d item(s) listed, %d with download link", len(items), len(out))
     return out
 
 
@@ -135,15 +244,14 @@ async def _custom(url: str) -> list[TeraFile]:
 
 
 async def resolve(url: str) -> list[TeraFile]:
-    surl = get_surl(url)
     errors: list[str] = []
-    if surl and TERABOX_COOKIE:
+    if TERABOX_COOKIE:
         try:
-            async with aiohttp.ClientSession(headers=_headers(), timeout=aiohttp.ClientTimeout(total=30)) as s:
-                files = await _official(surl, s)
+            async with aiohttp.ClientSession(headers=_headers(), timeout=aiohttp.ClientTimeout(total=45)) as s:
+                files = await _official(url, s)
             if files:
                 return files
-            errors.append("official: no files")
+            errors.append("official: files found but no download link")
         except Exception as ex:
             errors.append(f"official: {ex}")
     if TERABOX_API_URL:
@@ -156,7 +264,9 @@ async def resolve(url: str) -> list[TeraFile]:
             errors.append(f"api: {ex}")
     if not (TERABOX_COOKIE or TERABOX_API_URL):
         raise TeraboxError("Bot is not configured (TERABOX_COOKIE / TERABOX_API_URL missing).")
-    raise TeraboxError("Could not fetch this link. It may be expired, private or blocked. " + " | ".join(errors)[:200])
+    log.warning("resolve failed: %s", " | ".join(errors))
+    raise TeraboxError("Could not fetch this link. It may be expired, private or blocked. "
+                       + " | ".join(errors)[:220])
 
 
 # ---------- download ----------
