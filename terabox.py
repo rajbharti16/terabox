@@ -88,7 +88,7 @@ def _find_token(page: str) -> Optional[str]:
 
 
 def _why(errno, msg="") -> str:
-    if errno == 400210:
+    if errno == 400210 or "verify" in str(msg).lower():
         return "Terabox asks for verification (need verify_v2), direct access is blocked"
     return f"Terabox error {errno} {msg}".strip()
 
@@ -105,21 +105,16 @@ async def _get_json(s: aiohttp.ClientSession, url: str, params: dict) -> dict:
         return {}
 
 
-async def _official(url: str, s: aiohttp.ClientSession) -> list[TeraFile]:
-    async with s.get(url, allow_redirects=True) as r:
-        page = await r.text()
-        status = r.status
-        final_url = str(r.url)
-    fin = urlparse(final_url)
-    base = f"{fin.scheme}://{fin.netloc}"
-    surl = (parse_qs(fin.query).get("surl") or [None])[0] or get_surl(final_url) or get_surl(url)
+async def _fetch_page(s: aiohttp.ClientSession, page_url: str):
+    async with s.get(page_url, allow_redirects=True) as r:
+        return await r.text(), r.status, str(r.url)
+
+
+async def _attempt(s: aiohttp.ClientSession, base: str, page: str, surl: str) -> list[TeraFile]:
     token = _find_token(page)
     m = re.search(r"dp-logid=([^&\"'\s]+)", page)
     logid = m.group(1) if m else None
-    log.info("share page: HTTP %s host=%s surl=%s jsToken=%s logid=%s cookie=%s",
-             status, fin.netloc, bool(surl), bool(token), bool(logid), bool(TERABOX_COOKIE))
-    if not surl:
-        raise TeraboxError("Could not read the share id from this link.")
+    log.info("try %s: jsToken=%s logid=%s", urlparse(base).netloc, bool(token), bool(logid))
 
     common = {"app_id": "250528", "web": "1", "channel": "0"}
     if token:
@@ -130,6 +125,8 @@ async def _official(url: str, s: aiohttp.ClientSession) -> list[TeraFile]:
 
     async def list_dir(path, extra):
         q = {**list_params, **extra}
+        if "shareid" in extra:          # signed call: identify the share by shareid/uk, not shorturl
+            q.pop("shorturl", None)
         if path is not None:
             q.update({"dir": path, "root": "0"})
         data = await _get_json(s, f"{base}/share/list", q)
@@ -155,20 +152,20 @@ async def _official(url: str, s: aiohttp.ClientSession) -> list[TeraFile]:
         return out
 
     signed: dict = {}
-    first_err: Optional[Exception] = None
-    items: list[dict] = []
 
     async def get_signed() -> dict:
         nonlocal signed
         if signed:
             return signed
-        info = await _get_json(s, f"{base}/api/shorturlinfo", list_params)
+        info = await _get_json(s, f"{base}/api/shorturlinfo", {**common, "shorturl": "1" + surl, "root": "1"})
         errno = info.get("errno", -1)
         if errno != 0:
             raise TeraboxError(_why(errno, info.get("errmsg", "")))
         signed = {k: str(info[k]) for k in ("sign", "timestamp", "shareid", "uk", "randsk") if info.get(k) is not None}
         return signed
 
+    first_err: Optional[Exception] = None
+    items: list[dict] = []
     try:
         items = await collect({})
     except TeraboxError as ex:
@@ -208,6 +205,37 @@ async def _official(url: str, s: aiohttp.ClientSession) -> list[TeraFile]:
             ))
     log.info("official resolver: %d item(s) listed, %d with download link", len(items), len(out))
     return out
+
+
+async def _official(url: str, s: aiohttp.ClientSession) -> list[TeraFile]:
+    page, status, final_url = await _fetch_page(s, url)
+    fin = urlparse(final_url)
+    surl = (parse_qs(fin.query).get("surl") or [None])[0] or get_surl(final_url) or get_surl(url)
+    log.info("share page: HTTP %s host=%s surl=%s cookie=%s", status, fin.netloc, bool(surl), bool(TERABOX_COOKIE))
+    if not surl:
+        raise TeraboxError("Could not read the share id from this link.")
+
+    # the link may redirect to a mirror (1024tera.com ...); also try the main Terabox hosts
+    base0 = f"{fin.scheme}://{fin.netloc}"
+    attempts = [(base0, page)]
+    for b in ("https://www.terabox.com", "https://www.terabox.app"):
+        if b != base0:
+            attempts.append((b, None))
+
+    errors: list[str] = []
+    for base, pg in attempts:
+        host = urlparse(base).netloc
+        try:
+            if pg is None:
+                pg, _, _ = await _fetch_page(s, f"{base}/wap/share/filelist?surl={surl}")
+            files = await _attempt(s, base, pg, surl)
+            if files:
+                return files
+            errors.append(f"{host}: no download link")
+        except Exception as ex:
+            log.info("host %s failed: %s", host, ex)
+            errors.append(f"{host}: {ex}")
+    raise TeraboxError(" ; ".join(errors)[:200])
 
 
 # ---------- 2) third-party resolver API ----------
