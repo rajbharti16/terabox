@@ -264,11 +264,25 @@ def _walk_json(obj) -> list[TeraFile]:
 
 
 async def _custom(url: str) -> list[TeraFile]:
+    """TERABOX_API_URL formats:
+         https://host/api?url={url}          -> GET
+         POST https://host/download          -> POST  {"url": "<terabox link>"}
+    """
+    spec, method = TERABOX_API_URL, "GET"
+    if spec.upper().startswith("POST "):
+        method, spec = "POST", spec[5:].strip()
+    spec = spec.replace("{url}", quote(url, safe=""))
     # separate session: never send the Terabox cookie to a third-party API
-    async with aiohttp.ClientSession(headers={"User-Agent": UA}, timeout=aiohttp.ClientTimeout(total=45)) as s:
-        async with s.get(TERABOX_API_URL.format(url=quote(url, safe=""))) as r:
+    async with aiohttp.ClientSession(headers={"User-Agent": UA}, timeout=aiohttp.ClientTimeout(total=60)) as s:
+        req = s.post(spec, json={"url": url}) if method == "POST" else s.get(spec)
+        async with req as r:
+            if r.status >= 400:
+                raise TeraboxError(f"API HTTP {r.status}")
             data = await r.json(content_type=None)
-    return _walk_json(data)
+    files = _walk_json(data)
+    if not files:
+        log.warning("API returned no usable files: %.300r", data)
+    return files
 
 
 async def resolve(url: str) -> list[TeraFile]:
